@@ -1,0 +1,287 @@
+---
+# ============================================================
+# TravelMemory MERN Stack - Complete Ansible Playbook
+# ============================================================
+
+# -------------------------------------------------------
+# PLAY 1: Common Security Hardening (Both Servers)
+# -------------------------------------------------------
+- name: Common Security Hardening
+  hosts: all
+  become: yes
+  tasks:
+
+    - name: Update and upgrade all packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+        cache_valid_time: 3600
+
+    - name: Install essential security packages
+      apt:
+        name:
+          - ufw
+          - fail2ban
+          - unattended-upgrades
+        state: present
+
+    - name: Disable root SSH login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin'
+        line: 'PermitRootLogin no'
+        state: present
+      notify: Restart SSH
+
+    - name: Disable password-based SSH authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        state: present
+      notify: Restart SSH
+
+    - name: Enable fail2ban
+      service:
+        name: fail2ban
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: Restart SSH
+      service:
+        name: ssh
+        state: restarted
+
+# -------------------------------------------------------
+# PLAY 2: Web Server Setup (Node.js + React + PM2)
+# -------------------------------------------------------
+- name: Web Server Configuration
+  hosts: web
+  become: yes
+  vars:
+    app_dir: /var/www/travelmemory
+    db_private_ip: "{{ hostvars['db-server']['ansible_host'] }}"
+    node_version: "18"
+
+  tasks:
+
+    - name: Configure UFW - Allow SSH
+      ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: Configure UFW - Allow React Frontend
+      ufw:
+        rule: allow
+        port: "3000"
+        proto: tcp
+
+    - name: Configure UFW - Allow Node Backend
+      ufw:
+        rule: allow
+        port: "5000"
+        proto: tcp
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+        policy: deny
+
+    - name: Install Node.js dependencies
+      apt:
+        name:
+          - curl
+          - git
+          - build-essential
+        state: present
+
+    - name: Add NodeSource APT repository for Node.js {{ node_version }}
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_{{ node_version }}.x | bash -
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+
+    - name: Install Node.js and NPM
+      apt:
+        name: nodejs
+        state: present
+        update_cache: yes
+
+    - name: Install PM2 globally
+      npm:
+        name: pm2
+        global: yes
+        state: present
+
+    - name: Create application directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Clone TravelMemory repository
+      git:
+        repo: "https://github.com/UnpredictablePrashant/TravelMemory.git"
+        dest: "{{ app_dir }}"
+        version: master
+        force: yes
+      become_user: ubuntu
+
+    - name: Install backend dependencies
+      npm:
+        path: "{{ app_dir }}/backend"
+        state: present
+      become_user: ubuntu
+
+    - name: Create backend .env file
+      copy:
+        dest: "{{ app_dir }}/backend/.env"
+        content: |
+          MONGO_URI=mongodb://tmuser:tmpassword@{{ db_private_ip }}:27017/travelmemory
+          PORT=5000
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    - name: Start backend with PM2
+      shell: |
+        cd {{ app_dir }}/backend
+        pm2 delete travelmemory-backend || true
+        pm2 start index.js --name travelmemory-backend
+        pm2 save
+      become_user: ubuntu
+
+    - name: Install frontend dependencies
+      npm:
+        path: "{{ app_dir }}/frontend"
+        state: present
+      become_user: ubuntu
+
+    - name: Set backend API URL in frontend config
+      copy:
+        dest: "{{ app_dir }}/frontend/.env"
+        content: |
+          REACT_APP_BACKEND_URL=http://{{ ansible_host }}:5000
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+
+    - name: Build React frontend
+      shell: |
+        cd {{ app_dir }}/frontend
+        npm run build
+      become_user: ubuntu
+      environment:
+        CI: "false"
+
+    - name: Install serve to host React build
+      npm:
+        name: serve
+        global: yes
+        state: present
+
+    - name: Serve React build with PM2
+      shell: |
+        pm2 delete travelmemory-frontend || true
+        pm2 start serve --name travelmemory-frontend -- -s {{ app_dir }}/frontend/build -l 3000
+        pm2 save
+      become_user: ubuntu
+
+    - name: Configure PM2 to start on boot
+      shell: |
+        pm2 startup systemd -u ubuntu --hp /home/ubuntu
+        pm2 save
+      become_user: ubuntu
+
+# -------------------------------------------------------
+# PLAY 3: Database Server Setup (MongoDB)
+# -------------------------------------------------------
+- name: Database Server Configuration
+  hosts: db
+  become: yes
+
+  tasks:
+
+    - name: Configure UFW - Allow SSH from Web Server
+      ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: Configure UFW - Allow MongoDB from Private Subnet only
+      ufw:
+        rule: allow
+        src: "10.0.1.0/24"
+        port: "27017"
+        proto: tcp
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+        policy: deny
+
+    - name: Install required packages for MongoDB
+      apt:
+        name:
+          - gnupg
+          - curl
+          - python3-pymongo
+        state: present
+
+    - name: Add MongoDB GPG key
+      apt_key:
+        url: https://www.mongodb.org/static/pgp/server-6.0.asc
+        state: present
+
+    - name: Add MongoDB APT repository
+      apt_repository:
+        repo: "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse"
+        state: present
+        filename: mongodb-org-6.0
+
+    - name: Install MongoDB
+      apt:
+        name: mongodb-org
+        state: present
+        update_cache: yes
+
+    - name: Configure MongoDB bind IP to allow internal network
+      lineinfile:
+        path: /etc/mongod.conf
+        regexp: '^\s*bindIp:'
+        line: '  bindIp: 0.0.0.0'
+      notify: Restart MongoDB
+
+    - name: Start and enable MongoDB service
+      service:
+        name: mongod
+        state: started
+        enabled: yes
+
+    - name: Wait for MongoDB to become available
+      wait_for:
+        port: 27017
+        delay: 5
+        timeout: 60
+
+    - name: Create MongoDB application user
+      community.mongodb.mongodb_user:
+        login_host: localhost
+        login_port: 27017
+        database: travelmemory
+        name: tmuser
+        password: tmpassword
+        roles:
+          - db: travelmemory
+            role: readWrite
+        state: present
+
+  handlers:
+    - name: Restart MongoDB
+      service:
+        name: mongod
+        state: restarted
